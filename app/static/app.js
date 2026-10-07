@@ -13,6 +13,15 @@ const state = {
   // 在途求解请求的输入指纹；null 表示当前无在途求解。输入一旦变化，
   // 不必等响应回来即可作废该请求并释放求解按钮。
   pendingKey: null,
+  // 保存请求归属（与求解归属平行的一套裁决状态）：
+  //   planCtx —— 方案上下文序号：新建/打开发起/打开落地/删除当前方案时
+  //     递增；保存响应回来时序号不匹配即为过期响应；
+  //   saveSeq —— 保存请求序号，每次点击保存递增；
+  //   saveAppliedSeq —— 已落地（允许更新当前页面）的最后一个保存响应的
+  //     序号；较早响应不得回退较新的绑定。
+  planCtx: 0,
+  saveSeq: 0,
+  saveAppliedSeq: 0,
   planMenuOpen: false,
 };
 
@@ -339,10 +348,13 @@ function setSolveBusy(busy) {
 }
 
 // 方案上下文切换（新建/打开/删除当前方案）：
-// 作废旧求解请求、撤下旧结果、复位求解按钮。
+// 作废旧求解请求、撤下旧结果、复位求解按钮；
+// 方案上下文序号递增：在途保存请求的迟到响应随之过期——
+// 成功只保留服务端保存结果，失败不对当前页报错。
 function switchPlanContext() {
   state.solveSeq++;
   state.pendingKey = null;
+  state.planCtx++;
   invalidateResult();
   setSolveBusy(false);
 }
@@ -691,6 +703,18 @@ function niceStep(raw) {
 
 // --------------------------- 保存 / 打开 ---------------------------
 
+// 保存响应归属规则（与求解响应同理，按“方案上下文 + 草稿变化 + 请求先后”
+// 裁决迟到的响应能否更新当前页面）：
+//   * 发起时记录方案上下文 reqCtx、请求序号 reqId 与名称草稿 reqName；
+//   * 响应回来时方案上下文已切换（新建/打开/删除当前方案，含打开落地）：
+//     成功只保留服务端保存结果——不得把当前页绑回旧方案（否则后续保存会
+//     覆盖旧方案），失败不对当前页报错，一律静默；
+//   * 上下文未变但已有较新的保存响应落地：较早响应不得回退较新的绑定，
+//     静默丢弃；
+//   * 上下文未变且按序落地：绑定返回的 planId——同一方案在等待期继续
+//     编辑不影响该绑定，成功创建的 ID 仍用于后续覆盖保存；名称仅当等待期
+//     未被改动时才回写服务端规整名，旧名称不得覆盖新草稿；
+//   * 保存不触碰展示中的协调结果：输入未变动时有效结果照常保留。
 async function savePlan() {
   collectPlan();
   const errs = validatePlan(plan);
@@ -699,10 +723,14 @@ async function savePlan() {
     return;
   }
   const payload = toApiPayload(plan);
+  const reqId = ++state.saveSeq;
+  const reqCtx = state.planCtx;
+  const reqPlanId = state.planId;
+  const reqName = plan.name; // 发起时刻的名称草稿（collectPlan 已同步）
   try {
     let resp;
-    if (state.planId) {
-      resp = await fetch(`/api/plans/${state.planId}`, {
+    if (reqPlanId) {
+      resp = await fetch(`/api/plans/${reqPlanId}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
@@ -719,10 +747,18 @@ async function savePlan() {
       throw new Error(d.detail || `HTTP ${resp.status}`);
     }
     const saved = await resp.json();
+    if (reqCtx !== state.planCtx) return; // 过期成功响应：仅保留服务端保存结果
+    if (reqId <= state.saveAppliedSeq) return; // 不得回退较新的绑定
+    state.saveAppliedSeq = reqId;
     state.planId = saved.id;
-    $("#planName").value = saved.name;
+    // 名称草稿在等待期被改动过则保留用户新草稿，否则回写服务端规整名
+    if ($("#planName").value.trim() === reqName) {
+      $("#planName").value = saved.name;
+    }
     toast(`方案「${saved.name}」已保存（#${saved.id}）`);
   } catch (e) {
+    if (reqCtx !== state.planCtx) return; // 过期失败响应：不对当前页报错
+    if (reqId !== state.saveSeq) return; // 已有更新的保存请求：成败由其自身报告
     toast("保存失败：" + e.message, true);
   }
 }
@@ -781,6 +817,9 @@ async function loadPlan(id) {
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const rec = await resp.json();
     if (reqId !== state.solveSeq) return; // 过期成功响应：不得回填
+    // 打开落地本身也是一次方案上下文切换：等待期内（按旧表单）发起的
+    // 保存请求随之过期，其迟到响应不得绑定到新打开的方案。
+    state.planCtx++;
     const d = rec.plan;
     plan = {
       name: d.name,
